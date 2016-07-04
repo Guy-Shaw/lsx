@@ -1,0 +1,223 @@
+#! /usr/bin/perl -w
+    eval 'exec /usr/bin/perl -S $0 ${1+"$@"}'
+        if 0; #$running_under_some_shell
+
+# Filename: lsx
+# Brief: ls parts explosion -- list all components of pathnames
+#
+# Copyright (C) 2016 Guy Shaw
+# Written by Guy Shaw <gshaw@acm.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=pod
+
+=begin description
+
+List all the components of the given path names.
+
+=end description
+
+# Recipe: lsx with just permissions:
+#
+#   lsx "$@" \
+#   | perl -e 'while (<>) {
+#       ($perm, $lk, $g, $u, $sz, $t1, $t2, $t3, $path) = split;
+#       print $perm, " ", $path, "\n";
+#       }'
+
+=cut
+
+require 5.0;
+use strict;
+use warnings;
+use Carp;
+use diagnostics;
+use Getopt::Long;
+use File::Spec::Functions;
+use Cwd qw(getcwd);             # Needed at least for explain_cwd()
+
+my $eprint_fh;
+my $dprint_fh;
+
+my $debug    = 0;
+my $verbose  = 0;
+my $relative = 0;
+my $follow   = 0;
+my $header   = 0;
+
+# my @ls_opt = ( '-dE' );
+my @ls_opt = ( '-dlh' );
+my @ls_argv = ( );
+
+my @options = (
+    'debug'    => \$debug,
+    'verbose'  => \$verbose,
+    'relative' => \$relative,
+    'follow'   => \$follow,
+    'header'   => \$header,
+);
+
+my $cwd;
+my @workq = ();
+
+#:subroutines:#
+
+# Decide how to direct eprint*() and dprint*() functions.
+# If STDOUT and STDERR are directed to the same "channel",
+# then eprint*() and dprint*() should be tied to the same file handle.
+#
+# Otherwise, buffering could cause a mix of STDOUT and STDERR to
+# be written out of order.
+#
+sub set_print_fh {
+    my @stdout_statv;
+    my @stderr_statv;
+    my $stdout_chan;
+    my $stderr_chan;
+
+    @stdout_statv = stat(*STDOUT);
+    @stderr_statv = stat(*STDERR);
+    $stdout_chan = join(':', @stdout_statv[0, 1, 6]);
+    $stderr_chan = join(':', @stderr_statv[0, 1, 6]);
+    if (!defined($eprint_fh)) {
+        $eprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+    if (!defined($dprint_fh)) {
+        $dprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+}
+
+sub eprint {
+    if (-t $eprint_fh) {
+        print {$eprint_fh} "\e[01;31m\e[K", @_, "\e[m\e[K";
+    }
+    else {
+        print {$eprint_fh} @_;
+    }
+}
+
+sub eprintf {
+    if (-t $eprint_fh) {
+        print  {$eprint_fh}  "\e[01;31m\e[K";
+        printf {$eprint_fh} @_;
+        print  {$eprint_fh}  "\e[m\e[K";
+    }
+    else {
+        printf {$eprint_fh} @_;
+    }
+}
+
+sub dprint {
+    print {$dprint_fh} @_ if ($debug);
+}
+
+sub dprintf {
+    printf {$dprint_fh} @_ if ($debug);
+}
+
+sub ls_explode {
+    local($_) = @_;
+    my $pfx;
+    my $sfx;
+    my $parent;
+    my $dir;
+    my $realdir;
+
+    dprint "ls_explode($_)\n";
+
+    if (m@//@) {
+        s@//@\000\000@;
+    }
+    s@/+@/@g;
+    if (!$relative) {
+        if (!m@^/@) {
+            $_ = $cwd . '/' . $_;
+        }
+    }
+    if (m@\000\000@) {
+        $pfx = $`;
+        $sfx = $';
+    }
+    elsif (m@^/@) {
+        $pfx = '/';
+        $sfx = $_;
+        $sfx =~ s@^/@@;
+    }
+    else {
+        $pfx = '';
+        $sfx = $_;
+    }
+    $parent = $pfx;
+    for (split(m@/+@, $sfx)) {
+        if ($parent =~ m@/$@) {
+            $dir = $parent . $_;
+        }
+        elsif ($parent ne '') {
+            $dir = $parent . '/' . $_;
+        }
+        else {
+            # $dir = $cwd . '/' . $_;
+            $dir = $_;
+        }
+        push(@ls_argv, $dir);
+        while (-l $dir && -d "${dir}/.") {
+            $realdir = qx(cd ${dir} ; /bin/pwd);    # crude, but effective
+            chop($realdir);
+            push(@ls_argv, $realdir);
+            $dir = $realdir;
+        }
+        last if (!-d $dir);
+        $parent = $dir;
+    }
+}
+
+#:options:#
+
+GetOptions(@options) or exit 2;
+
+#:main:#
+
+set_print_fh();
+
+$cwd = getcwd();
+
+my $path_nr = 0;
+
+for my $path (@ARGV) {
+    if ($path_nr > 0) {
+        print "\n";
+    }
+    if ($header) {
+        print $path,"\n";
+        print '-' x length($path), "\n";
+    }
+    @ls_argv = ();
+    push(@workq, $path);
+    while (scalar(@workq) != 0) {
+        ls_explode(shift(@workq));
+        if ($verbose) {
+            print join(' ', @ls_argv), "\n";
+        }
+        system('ls', @ls_opt, @ls_argv);
+        if (scalar(@ls_argv) != 0 && $follow && -l $ls_argv[-1]) {
+            my $new_path = readlink($ls_argv[-1]);
+            push(@workq, $new_path);
+            @ls_argv = ();
+        }
+    }
+    ++$path_nr;
+}
+
+exit 0;
