@@ -45,14 +45,15 @@ use warnings;
 use Carp;
 use diagnostics;
 use Getopt::Long;
-use File::Spec::Functions;
-use Cwd qw(getcwd);             # Needed at least for explain_cwd()
+use File::Spec::Functions qw(catfile splitpath);
+use Cwd qw(getcwd abs_path);
 
 my $eprint_fh;
 my $dprint_fh;
 
 my $debug    = 0;
 my $verbose  = 0;
+my $lower    = 0;
 my $relative = 0;
 my $follow   = 0;
 my $header   = 0;
@@ -64,6 +65,7 @@ my @ls_argv = ( );
 my @options = (
     'debug'    => \$debug,
     'verbose'  => \$verbose,
+    'lower'    => \$lower,
     'relative' => \$relative,
     'follow'   => \$follow,
     'header'   => \$header,
@@ -71,6 +73,7 @@ my @options = (
 
 my $cwd;
 my @workq = ();
+my %seen_dir = ();
 
 #:subroutines:#
 
@@ -128,54 +131,62 @@ sub dprintf {
 }
 
 sub ls_explode {
-    local($_) = @_;
+    my ($path) = @_;
     my $pfx;
     my $sfx;
-    my $parent;
-    my $dir;
-    my $realdir;
 
-    dprint "ls_explode($_)\n";
+    dprint "ls_explode($path)\n";
 
-    if (m@//@) {
-        s@//@\000\000@;
+    if ($path =~ m{//}msx) {
+        $path =~ s{//}{\000\000}msx;
     }
-    s@/+@/@g;
+    $path =~ s{/+}{/}gmsx;
     if (!$relative) {
-        if (!m@^/@) {
-            $_ = $cwd . '/' . $_;
+        if ($path !~ m{\A/}msx) {
+            $path = $cwd . '/' . $path;
         }
     }
-    if (m@\000\000@) {
+    if ($path =~ m{\000\000}msx) {
         $pfx = $`;
         $sfx = $';
     }
-    elsif (m@^/@) {
+    elsif ($path =~ m{\A/}msx) {
         $pfx = '/';
-        $sfx = $_;
-        $sfx =~ s@^/@@;
+        $sfx = $path;
+        $sfx =~ s{\A/}{}msx;
     }
     else {
         $pfx = '';
-        $sfx = $_;
+        $sfx = $path;
     }
-    $parent = $pfx;
-    for (split(m@/+@, $sfx)) {
-        if ($parent =~ m@/$@) {
-            $dir = $parent . $_;
+
+    my $parent = $pfx;
+    for my $part (split(m{/+}msx, $sfx)) {
+        my $dir;
+
+        if ($parent =~ m{/\z}msx) {
+            $dir = $parent . $part;
         }
         elsif ($parent ne '') {
-            $dir = $parent . '/' . $_;
+            $dir = $parent . '/' . $part;
         }
         else {
-            # $dir = $cwd . '/' . $_;
-            $dir = $_;
+            # $dir = $cwd . '/' . $part;
+            $dir = $part;
         }
-        push(@ls_argv, $dir);
+
+        if (!defined($seen_dir{$dir})) {
+            push(@ls_argv, $dir);
+            $seen_dir{$dir} = 1;
+        }
+
         while (-l $dir && -d "${dir}/.") {
-            $realdir = qx(cd ${dir} ; /bin/pwd);    # crude, but effective
+            my $realdir = qx(cd ${dir} ; /bin/pwd);    # crude, but effective
             chop($realdir);
-            push(@ls_argv, $realdir);
+            if (!defined($seen_dir{$realdir})) {
+                push(@ls_argv, $realdir);
+                $seen_dir{$realdir} = 1;
+            }
             $dir = $realdir;
         }
         last if (!-d $dir);
@@ -185,11 +196,12 @@ sub ls_explode {
 
 #:options:#
 
+set_print_fh();
+
 GetOptions(@options) or exit 2;
 
 #:main:#
 
-set_print_fh();
 
 $cwd = getcwd();
 
@@ -206,14 +218,33 @@ for my $path (@ARGV) {
     @ls_argv = ();
     push(@workq, $path);
     while (scalar(@workq) != 0) {
-        ls_explode(shift(@workq));
-        if ($verbose) {
-            print join(' ', @ls_argv), "\n";
+        my $cur_path = shift(@workq);
+        ls_explode($cur_path);
+
+        my @cmdv = ('ls', @ls_opt, @ls_argv);
+        if ($lower || $verbose) {
+            print join(' ', @cmdv), "\n";
         }
-        system('ls', @ls_opt, @ls_argv);
+        if (!$lower) {
+            system('ls', @ls_opt, @ls_argv);
+        }
+
         if (scalar(@ls_argv) != 0 && $follow && -l $ls_argv[-1]) {
-            my $new_path = readlink($ls_argv[-1]);
-            push(@workq, $new_path);
+            my $new_path;
+            my $new_abs_path;
+
+            $new_path = readlink($ls_argv[-1]);
+            if ($new_path !~ m{\A/}msx) {
+                my ($vol, $cur_dir, $sfn) = splitpath($cur_path);
+                my $new_rel_path = catfile($cur_dir, $new_path);
+                dprint "new_rel_path=[${new_rel_path}]\n";
+                $new_abs_path = abs_path($new_rel_path);
+            }
+            else {
+                $new_abs_path = $new_path;
+            }
+
+            push(@workq, $new_abs_path);
             @ls_argv = ();
         }
     }
